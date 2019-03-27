@@ -3,6 +3,10 @@ module ActiveRecord
     module SQLServer
       module DatabaseStatements
 
+        def select_rows(sql, name = nil, binds = [])
+          sp_executesql sql, name, binds, fetch: :rows
+        end
+
         def execute(sql, name = nil)
           if id_insert_table_name = query_requires_identity_insert?(sql)
             with_identity_insert_enabled(id_insert_table_name) { do_execute(sql, name) }
@@ -15,22 +19,24 @@ module ActiveRecord
           sp_executesql(sql, name, binds, prepare: prepare)
         end
 
-        def exec_insert(sql, name = nil, binds = [], pk = nil, _sequence_name = nil)
+        def exec_insert(sql, name, binds, pk = nil, _sequence_name = nil)
           if id_insert_table_name = exec_insert_requires_identity?(sql, pk, binds)
-            with_identity_insert_enabled(id_insert_table_name) { super(sql, name, binds, pk) }
+            with_identity_insert_enabled(id_insert_table_name) { exec_query(sql, name, binds) }
           else
-            super(sql, name, binds, pk)
+            exec_query(sql, name, binds)
           end
         end
 
         def exec_delete(sql, name, binds)
-          sql = sql.dup << '; SELECT @@ROWCOUNT AS AffectedRows'
-          super(sql, name, binds).rows.first.first
+          super.rows.first.try(:first) || super("SELECT @@ROWCOUNT As AffectedRows", "", []).rows.first.try(:first)
         end
 
         def exec_update(sql, name, binds)
-          sql = sql.dup << '; SELECT @@ROWCOUNT AS AffectedRows'
-          super(sql, name, binds).rows.first.first
+          super.rows.first.try(:first) || super("SELECT @@ROWCOUNT As AffectedRows", "", []).rows.first.try(:first)
+        end
+
+        def supports_statement_cache?
+          true
         end
 
         def begin_db_transaction
@@ -72,55 +78,17 @@ module ActiveRecord
         end
 
         def case_sensitive_comparison(table, attribute, column, value)
-          if column.collation && !column.case_sensitive?
-            table[attribute].eq(Arel::Nodes::Bin.new(value))
+          if value && value.acts_like?(:string)
+            table[attribute].eq(Arel::Nodes::Bin.new(Arel::Nodes::BindParam.new))
           else
             super
-          end
-        end
-
-        # We should propose this change to Rails team
-        def insert_fixtures_set(fixture_set, tables_to_delete = [])
-          fixture_inserts = []
-
-          fixture_set.each do |table_name, fixtures|
-            fixtures.each_slice(insert_rows_length) do |batch|
-              fixture_inserts << build_fixture_sql(batch, table_name)
-            end
-          end
-
-          table_deletes = tables_to_delete.map { |table| "DELETE FROM #{quote_table_name table}".dup }
-          total_sql = Array.wrap(combine_multi_statements(table_deletes + fixture_inserts))
-
-          disable_referential_integrity do
-            transaction(requires_new: true) do
-              total_sql.each do |sql|
-                execute sql, "Fixtures Load"
-                yield if block_given?
-              end
-            end
           end
         end
 
         def can_perform_case_insensitive_comparison_for?(column)
-          column.type == :string && (!column.collation || column.case_sensitive?)
+          column.type == :string
         end
         private :can_perform_case_insensitive_comparison_for?
-
-        def combine_multi_statements(total_sql)
-          total_sql
-        end
-        private :combine_multi_statements
-
-        def default_insert_value(column)
-          if column.is_identity?
-            table_name = quote(quote_table_name(column.table_name))
-            Arel.sql("IDENT_CURRENT(#{table_name}) + IDENT_INCR(#{table_name})")
-          else
-            super
-          end
-        end
-        private :default_insert_value
 
         # === SQLServer Specific ======================================== #
 
@@ -142,6 +110,18 @@ module ActiveRecord
                 yield(r) if block_given?
               end
               result.each.map { |row| row.is_a?(Hash) ? row.with_indifferent_access : row }
+            when :odbc
+              results = []
+              raw_connection_run(sql) do |handle|
+                get_rows = lambda do
+                  rows = handle_to_names_and_values handle, fetch: :all
+                  rows.each_with_index { |r, i| rows[i] = r.with_indifferent_access }
+                  results << rows
+                end
+                get_rows.call
+                get_rows.call while handle_more_results?(handle)
+              end
+              results.many? ? results : results.first
             end
           end
         end
@@ -226,20 +206,9 @@ module ActiveRecord
             table_name = query_requires_identity_insert?(sql)
             pk = primary_key(table_name)
           end
-          sql = if pk && use_output_inserted? && !database_prefix_remote_server?
+          sql = if pk && self.class.use_output_inserted && !database_prefix_remote_server?
                   quoted_pk = SQLServer::Utils.extract_identifiers(pk).quoted
-                  table_name ||= get_table_name(sql)
-                  exclude_output_inserted = exclude_output_inserted_table_name?(table_name, sql)
-                  if exclude_output_inserted
-                    id_sql_type = exclude_output_inserted.is_a?(TrueClass) ? 'bigint' : exclude_output_inserted
-                    <<-SQL.strip_heredoc
-                      DECLARE @ssaIdInsertTable table (#{quoted_pk} #{id_sql_type});
-                      #{sql.dup.insert sql.index(/ (DEFAULT )?VALUES/), " OUTPUT INSERTED.#{quoted_pk} INTO @ssaIdInsertTable"}
-                      SELECT CAST(#{quoted_pk} AS #{id_sql_type}) FROM @ssaIdInsertTable
-                    SQL
-                  else
-                    sql.dup.insert sql.index(/ (DEFAULT )?VALUES/), " OUTPUT INSERTED.#{quoted_pk}"
-                  end
+                  sql.insert sql.index(/ (DEFAULT )?VALUES/), " OUTPUT INSERTED.#{quoted_pk}"
                 else
                   "#{sql}; SELECT CAST(SCOPE_IDENTITY() AS bigint) AS Ident"
                 end
@@ -272,8 +241,6 @@ module ActiveRecord
         def sp_executesql_types_and_parameters(binds)
           types, params = [], []
           binds.each_with_index do |attr, index|
-            attr = attr.value if attr.is_a?(Arel::Nodes::BindParam)
-
             types << "@#{index} #{sp_executesql_sql_type(attr)}"
             params << sp_executesql_sql_param(attr)
           end
@@ -284,19 +251,19 @@ module ActiveRecord
           return attr.type.sqlserver_type if attr.type.respond_to?(:sqlserver_type)
           case value = attr.value_for_database
           when Numeric
-            value > 2_147_483_647 ? 'bigint'.freeze : 'int'.freeze
+            'int'.freeze
           else
             'nvarchar(max)'.freeze
           end
         end
 
         def sp_executesql_sql_param(attr)
-          case value = attr.value_for_database
+          case attr.value_for_database
           when Type::Binary::Data,
                ActiveRecord::Type::SQLServer::Data
-            quote(value)
+            quote(attr.value_for_database)
           else
-            quote(type_cast(value))
+            quote(type_cast(attr.value_for_database))
           end
         end
 
@@ -304,7 +271,7 @@ module ActiveRecord
           if name == 'EXPLAIN'
             params.each.with_index do |param, index|
               substitute_at_finder = /(@#{index})(?=(?:[^']|'[^']*')*$)/ # Finds unquoted @n values.
-              sql = sql.sub substitute_at_finder, param.to_s
+              sql.sub! substitute_at_finder, param.to_s
             end
           else
             types = quote(types.join(', '))
@@ -319,6 +286,8 @@ module ActiveRecord
           case @connection_options[:mode]
           when :dblib
             @connection.execute(sql).do
+          when :odbc
+            @connection.do(sql)
           end
         ensure
           @update_sql = false
@@ -326,31 +295,15 @@ module ActiveRecord
 
         # === SQLServer Specific (Identity Inserts) ===================== #
 
-        def use_output_inserted?
-          self.class.use_output_inserted
-        end
-
-        def exclude_output_inserted_table_names?
-          !self.class.exclude_output_inserted_table_names.empty?
-        end
-
-        def exclude_output_inserted_table_name?(table_name, sql)
-          return false unless exclude_output_inserted_table_names?
-          table_name ||= get_table_name(sql)
-          return false unless table_name
-          self.class.exclude_output_inserted_table_names[table_name]
-        end
-
         def exec_insert_requires_identity?(sql, pk, binds)
-          query_requires_identity_insert?(sql)
+          query_requires_identity_insert?(sql) if pk && binds.map(&:name).include?(pk)
         end
 
         def query_requires_identity_insert?(sql)
           if insert_sql?(sql)
             table_name = get_table_name(sql)
             id_column = identity_columns(table_name).first
-            # id_column && sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)[^(]+\([^)]*\b(#{id_column.name})\b,?[^)]*\)/i ? quote_table_name(table_name) : false
-            id_column && sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)[^(]+\([^)]*\b(#{id_column.name})\b,?[^)]*\)/i ? table_name : false
+            id_column && sql =~ /^\s*(INSERT|EXEC sp_executesql N'INSERT)[^(]+\([^)]*\b(#{id_column.name})\b,?[^)]*\)/i ? quote_table_name(table_name) : false
           else
             false
           end
@@ -381,12 +334,16 @@ module ActiveRecord
           case @connection_options[:mode]
           when :dblib
             @connection.execute(sql)
+          when :odbc
+            block_given? ? @connection.run_block(sql) { |handle| yield(handle) } : @connection.run(sql)
           end
         end
 
         def handle_more_results?(handle)
           case @connection_options[:mode]
           when :dblib
+          when :odbc
+            handle.more_results
           end
         end
 
@@ -394,6 +351,8 @@ module ActiveRecord
           case @connection_options[:mode]
           when :dblib
             handle_to_names_and_values_dblib(handle, options)
+          when :odbc
+            handle_to_names_and_values_odbc(handle, options)
           end
         end
 
@@ -407,10 +366,28 @@ module ActiveRecord
           options[:ar_result] ? ActiveRecord::Result.new(columns, results) : results
         end
 
+        def handle_to_names_and_values_odbc(handle, options = {})
+          @connection.use_utc = ActiveRecord::Base.default_timezone == :utc
+          if options[:ar_result]
+            columns = lowercase_schema_reflection ? handle.columns(true).map { |c| c.name.downcase } : handle.columns(true).map { |c| c.name }
+            rows = handle.fetch_all || []
+            ActiveRecord::Result.new(columns, rows)
+          else
+            case options[:fetch]
+            when :all
+              handle.each_hash || []
+            when :rows
+              handle.fetch_all || []
+            end
+          end
+        end
+
         def finish_statement_handle(handle)
           case @connection_options[:mode]
           when :dblib
             handle.cancel if handle
+          when :odbc
+            handle.drop if handle && handle.respond_to?(:drop) && !handle.finished?
           end
           handle
         end
